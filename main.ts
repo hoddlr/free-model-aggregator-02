@@ -247,6 +247,18 @@ function noteRefusal(id: string): void {
   lastRefused.set(id, arrival);
 }
 
+/**
+ * Models the gateway refused with 403 or 404: the account cannot dial
+ * them at all, so the refusal is permanent for the trial (a 429 or 5xx
+ * is transient and only cools the model down for one prompt instead).
+ * A banned model is never dialled again, which is what keeps a dead
+ * top-rated model from costing a call on every prompt after the first.
+ */
+const bannedModels = new Set<string>();
+function noteBan(id: string): void {
+  bannedModels.add(id);
+}
+
 /** Whether `id` refused on the prompt immediately before the current one. */
 function cooling(id: string): boolean {
   return lastRefused.get(id) === arrival - 1;
@@ -255,10 +267,11 @@ function cooling(id: string): boolean {
 /**
  * Every free model that can serve `needs`, best first: models not cooling
  * down by rating (ties keep brief order), then cooling models by the same
- * rule. The caller walks this list and dials until one answers.
+ * rule. Banned models are left out entirely. The caller walks this list
+ * and dials until one answers.
  */
 function rankedCandidates(needs: Needs): ModelRow[] {
-  const able = freeModels().filter((m) => capable(m, needs));
+  const able = freeModels().filter((m) => capable(m, needs) && !bannedModels.has(m.id));
   const withIndex = able.map((m, i) => ({ m, i }));
   withIndex.sort((a, b) => {
     const ca = cooling(a.m.id);
@@ -514,8 +527,13 @@ function sseLine(event: string | null, data: unknown): string {
   return `${event === null ? '' : `event: ${event}\n`}data: ${JSON.stringify(data)}\n\n`;
 }
 
-/** One upstream SSE frame with every data payload's `model` set to the dialled id. */
-function frameWithModel(frame: string, model: string): string {
+/**
+ * One upstream SSE frame with every data payload's `model` set to the dialled
+ * id. OpenRouter repeats `finish_reason` on the usage chunk that follows
+ * the finish chunk; the client's stream order allows exactly one chunk to
+ * carry one, so a second finish is rewritten to null (its usage survives).
+ */
+function frameWithModel(frame: string, model: string, state: { finishSeen: boolean }): string {
   const lines = frame.split('\n').map((line) => {
     const trimmed = line.trim();
     if (!trimmed.startsWith('data:')) return line;
@@ -523,7 +541,17 @@ function frameWithModel(frame: string, model: string): string {
     if (payload === '' || payload === '[DONE]') return line;
     try {
       const chunk: unknown = JSON.parse(payload);
-      if (isObj(chunk)) return `data: ${JSON.stringify({ ...chunk, model })}`;
+      if (!isObj(chunk)) return line;
+      const out: Json = { ...chunk, model };
+      const choices = Array.isArray(out.choices) ? out.choices : [];
+      let finishedHere = false;
+      for (const choice of choices) {
+        if (!isObj(choice) || choice.finish_reason === null || choice.finish_reason === undefined) continue;
+        if (state.finishSeen) choice.finish_reason = null;
+        else finishedHere = true;
+      }
+      if (finishedHere) state.finishSeen = true;
+      return `data: ${JSON.stringify(out)}`;
     } catch {
       // Not JSON: relay as it came.
     }
@@ -537,6 +565,7 @@ async function* relayOpenAIStream(upstream: ReadableStream<Uint8Array>, model: s
   const reader = upstream.getReader();
   const decoder = new TextDecoder();
   let buffer = '';
+  const state = { finishSeen: false };
   try {
     for (;;) {
       const { value, done } = await reader.read();
@@ -544,13 +573,13 @@ async function* relayOpenAIStream(upstream: ReadableStream<Uint8Array>, model: s
       buffer += decoder.decode(value, { stream: true }).replace(/\r\n/g, '\n');
       let at = buffer.indexOf('\n\n');
       while (at !== -1) {
-        yield frameWithModel(buffer.slice(0, at), model);
+        yield frameWithModel(buffer.slice(0, at), model, state);
         buffer = buffer.slice(at + 2);
         at = buffer.indexOf('\n\n');
       }
     }
     buffer += decoder.decode();
-    if (buffer.trim() !== '') yield frameWithModel(buffer, model);
+    if (buffer.trim() !== '') yield frameWithModel(buffer, model, state);
   } finally {
     reader.releaseLock();
   }
@@ -828,7 +857,8 @@ async function dialWithFailover(candidates: ModelRow[], body: Json): Promise<Dia
     if (upstream.ok) return { served: true, res: upstream, model: candidate.id, failures };
     const text = await upstream.text().catch(() => '');
     failures.push({ status: upstream.status, code: failureCode(upstream.status, text), model: candidate.id });
-    noteRefusal(candidate.id);
+    if (upstream.status === 403 || upstream.status === 404) noteBan(candidate.id);
+    else noteRefusal(candidate.id);
   }
   return { served: false, failures };
 }
@@ -906,7 +936,8 @@ async function messagesRoute(req: IncomingMessage, res: ServerResponse): Promise
     }
     const text = await upstream.text().catch(() => '');
     failures.push({ status: upstream.status, code: failureCode(upstream.status, text), model: candidate.id });
-    noteRefusal(candidate.id);
+    if (upstream.status === 403 || upstream.status === 404) noteBan(candidate.id);
+    else noteRefusal(candidate.id);
   }
   if (served === null) {
     return sendError(res, 'anthropic', 502, 'api_error', 'every free model that meets this request refused it', failures);
